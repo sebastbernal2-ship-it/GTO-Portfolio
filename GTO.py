@@ -4,12 +4,16 @@ import numpy as np
 from datetime import datetime
 from scipy.optimize import linprog
 from scipy.spatial.distance import jensenshannon
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
 import matplotlib.pyplot as plt
 
-# Asset universe: futures mapped to ETFs
+# ====================================
+# ASSET UNIVERSE
+# ====================================
 futures_to_etf = {
     'ES': 'SPY', 'NQ': 'QQQ', 'RTY': 'IWM', 'CL': 'USO',
     'GC': 'GLD', 'HG': 'CPER', 'NG': 'UNG', 'EUR': 'FXE',
@@ -27,7 +31,9 @@ for future, etf in futures_to_etf.items():
 
 print(f"\nDownloading data from {start} to {end}")
 
-# Download data
+# ====================================
+# DOWNLOAD DATA
+# ====================================
 data = {}
 for future, etf in futures_to_etf.items():
     print(f"Downloading {future} ({etf})...", end=" ")
@@ -55,9 +61,10 @@ for future, etf in futures_to_etf.items():
 
 print("\nDownload complete!")
 
-# Create DataFrame
+# ====================================
+# CREATE PRICE DATAFRAME
+# ====================================
 price_data = pd.DataFrame(data).ffill().dropna(how='all')
-
 print(f"\nPrice data shape: {price_data.shape}")
 
 if price_data.shape[1] > 0:
@@ -67,102 +74,68 @@ if price_data.shape[1] > 0:
     # ====================================
     daily_returns = price_data.pct_change()
 
-    # Map to ETF names for regime detection
+    # Map to ETF names
     etf_cols = [futures_to_etf[c] for c in price_data.columns]
     price_data_etf = price_data.copy()
     price_data_etf.columns = etf_cols
     daily_returns_etf = price_data_etf.pct_change()
 
-   
-
-
-   
-   
     # ====================================
-    # IMPROVED REGIME DETECTION (Forward-Looking Signals)
+    # K-MEANS REGIME DETECTION
     # ====================================
     print("\n" + "="*70)
-    print("REGIME DETECTION (Forward-Looking Signals)")
+    print("REGIME DETECTION (K-MEANS CLUSTERING)")
     print("="*70)
 
-    # Forward-looking regime indicators
+    print("\n[Building regime features...]")
+    
+    # Yield curve slope
     yc_ret_long = daily_returns_etf['TLT'].rolling(20).mean() * 252
     yc_ret_short = daily_returns_etf['IEF'].rolling(20).mean() * 252
     yc_slope = yc_ret_long - yc_ret_short
     
-    bond_momentum_20d = daily_returns_etf['TLT'].rolling(20).sum()
-    bond_momentum_60d = daily_returns_etf['TLT'].rolling(60).sum()
-    term_spread = bond_momentum_20d - bond_momentum_60d
-    
+    # Equity momentum
     equity_momentum = daily_returns_etf[['SPY', 'QQQ', 'IWM']].mean(axis=1).rolling(20).mean()
-    safe_momentum = (daily_returns_etf['TLT'].rolling(20).mean() + 
-                     daily_returns_etf['FXY'].rolling(20).mean()) / 2
-    credit_spread = equity_momentum - safe_momentum
     
+    # Commodity momentum
     commodity_momentum = daily_returns_etf[['USO', 'GLD', 'CPER']].mean(axis=1).rolling(30).mean()
-    gold_premium = daily_returns_etf['GLD'].rolling(60).mean() - daily_returns_etf['IEF'].rolling(60).mean()
     
+    # Realized volatility
     realized_vol = daily_returns_etf['SPY'].rolling(30).std() * np.sqrt(252)
-    vol_zscore = (realized_vol - realized_vol.rolling(120).mean()) / realized_vol.rolling(120).std()
 
-    regime_signals = pd.DataFrame(index=daily_returns_etf.index)
-    regime_signals['risk_on'] = (
-        (credit_spread > credit_spread.rolling(60).mean()) &
-        (equity_momentum > 0.005) &
-        (bond_momentum_20d < 0.02)
-    )
-    regime_signals['risk_off'] = (
-        (credit_spread < credit_spread.rolling(60).mean()) &
-        (bond_momentum_20d > bond_momentum_60d) &
-        (vol_zscore > 0.5)
-    )
-    regime_signals['inflation'] = (
-        (commodity_momentum > commodity_momentum.rolling(60).mean()) &
-        (gold_premium > 0) &
-        (yc_slope < 0)
-    )
-    regime_signals['normal'] = ~(
-        regime_signals['risk_on'] | regime_signals['risk_off'] | regime_signals['inflation']
-    )
+    # Stack and standardize
+    features = np.column_stack([
+        yc_slope.fillna(0),
+        equity_momentum.fillna(0),
+        commodity_momentum.fillna(0),
+        realized_vol.fillna(0)
+    ])
 
-    regime_id = pd.Series(3, index=daily_returns_etf.index)
-    regime_id[regime_signals['risk_off']] = 1
-    regime_id[regime_signals['inflation']] = 2
-    regime_id[regime_signals['risk_on']] = 0
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
 
-    regime_names = {0: 'Risk-On', 1: 'Risk-Off', 2: 'Inflation', 3: 'Normal'}
+    # K-Means
+    print("[Running K-means with 4 clusters...]")
+    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+    regime_id_raw = kmeans.fit_predict(features_scaled)
+    regime_id = pd.Series(regime_id_raw, index=daily_returns_etf.index)
 
-    print("\nRegime Balance (Forward-Looking):")
+    # Relabel by equity momentum (0=risk-on, 3=risk-off)
+    regime_equity_momentum = [equity_momentum[regime_id == r].mean() for r in range(4)]
+    regime_order = np.argsort(regime_equity_momentum)[::-1]
+    regime_relabel = {old: new for new, old in enumerate(regime_order)}
+    regime_id = regime_id.map(regime_relabel)
+
+    regime_names = {0: 'Risk-On', 1: 'Risk-Mid', 2: 'Risk-Low', 3: 'Risk-Off'}
+
+    print("\nRegime Balance (K-Means):")
     for r in range(4):
         count = (regime_id == r).sum()
         pct = count / len(regime_id) * 100
         print(f"  {regime_names[r]:<12}: {pct:>5.1f}% ({count:>5d} days)")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-   
-
     # ====================================
-    # REGIME-CONDITIONAL STATS
+    # REGIME-CONDITIONAL EXPECTED RETURNS
     # ====================================
     print("\nRegime-Conditional Expected Returns (ann %):")
     print("-" * 70)
@@ -174,7 +147,7 @@ if price_data.shape[1] > 0:
 
     for r in range(n_regimes):
         mask = regime_id == r
-        if mask.sum() > 252*2:
+        if mask.sum() > 252:
             ret_reg = daily_returns[mask]
             mu_reg[r] = ret_reg.mean() * 252
             sigma_reg[r] = ret_reg.cov() * 252
@@ -201,14 +174,11 @@ if price_data.shape[1] > 0:
     # GTO MAXIMIN OPTIMIZATION
     # ====================================
     print("\n" + "="*70)
-    print("GTO-INSPIRED PORTFOLIO CONSTRUCTION")
+    print("GTO-INSPIRED PORTFOLIO (K-MEANS REGIMES)")
     print("="*70)
 
     def solve_maximin_gto(mu_reg, long_only=True, max_weight=0.15):
-        """
-        Solve: max z s.t. w^T mu_r >= z for all regimes r,
-               sum(w) = 1, w_i in [0, max_weight] if long_only
-        """
+        """Maximin: max z s.t. w^T mu_r >= z for all regimes r"""
         n_assets = mu_reg.shape[1]
         n_regimes = mu_reg.shape[0]
 
@@ -236,8 +206,7 @@ if price_data.shape[1] > 0:
         else:
             bounds = [(-max_weight, max_weight) for _ in range(n_assets)] + [(None, None)]
 
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub,
-                      A_eq=A_eq, b_eq=b_eq,
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
                       bounds=bounds, method='highs')
 
         return res
@@ -273,7 +242,7 @@ if price_data.shape[1] > 0:
             payoff = regime_payoffs[r]
             print(f"{regime_names[r]:<12} {payoff*100:>9.2f}%", end='')
             if payoff == regime_payoffs.min():
-                print(f"  <-- GUARANTEED MIN (Worst case)")
+                print(f"  <-- GUARANTEED MIN")
             elif payoff == regime_payoffs.max():
                 print(f"  <-- BEST CASE")
             else:
@@ -281,21 +250,20 @@ if price_data.shape[1] > 0:
 
         print("-" * 70)
         print(f"\nGUARANTEED MINIMUM RETURN: {z_opt*100:.2f}%")
-        print(f"  → Portfolio never drops below this across regimes")
-        print(f"\nWORST-CASE REGIME: {regime_names[np.argmin(regime_payoffs)]}")
-        print(f"  → Even if market picks most adversarial regime")
+        print(f"WORST-CASE REGIME: {regime_names[np.argmin(regime_payoffs)]}")
 
     else:
         print(f"Optimization failed: {res.message}")
+        w_opt = np.ones(len(asset_names)) / len(asset_names)
+        z_opt = 0
 
     # ====================================
     # STABILITY ANALYSIS: IS vs OOS
     # ====================================
     print("\n" + "="*70)
-    print("STABILITY ANALYSIS FRAMEWORK")
+    print("STABILITY ANALYSIS FRAMEWORK (K-MEANS REGIMES)")
     print("="*70)
 
-    # Time split
     split_date = '2020-12-31'
     is_idx = daily_returns.index <= split_date
     oos_idx = daily_returns.index > split_date
@@ -505,12 +473,12 @@ if price_data.shape[1] > 0:
     if n_pass >= 3:
         print("\n→ VERDICT: Strategy shows reasonable stability.")
         print("  Edge and P/L distributions persist out-of-sample.")
-        print("  Can proceed to performance metrics (Sharpe, drawdown) as secondary validation.")
+        print("  GTO portfolio is TRADABLE with K-means regime detection.")
         is_stable = True
     else:
         print("\n→ VERDICT: Strategy lacks sufficient stability.")
         print("  Edge degrades significantly out-of-sample.")
-        print("  Performance metrics alone are unreliable. Needs redesign.")
+        print("  Consider alternative approaches (TSMOM, hybrid strategies).")
         is_stable = False
 
     # ====================================
