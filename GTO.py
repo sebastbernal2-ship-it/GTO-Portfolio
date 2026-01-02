@@ -2,10 +2,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from scipy.optimize import linprog
+from scipy.spatial.distance import jensenshannon
 import warnings
 warnings.filterwarnings('ignore')
 
-from scipy.optimize import linprog
+import matplotlib.pyplot as plt
 
 # Asset universe: futures mapped to ETFs
 futures_to_etf = {
@@ -85,9 +87,9 @@ if price_data.shape[1] > 0:
 
     # LOOSENED THRESHOLDS for balanced regime split
     regime_signals = pd.DataFrame(index=daily_returns_etf.index)
-    regime_signals['risk_on']  = (eq_ret_12m > 0.05)                        # Just positive eq returns
-    regime_signals['risk_off'] = (eq_ret_12m < -0.02) | (vix_proxy > 0.25)  # Negative eq OR elevated vol
-    regime_signals['inflation'] = (inf_proxy > 0.05)                        # Positive commodity momentum
+    regime_signals['risk_on']  = (eq_ret_12m > 0.05)
+    regime_signals['risk_off'] = (eq_ret_12m < -0.02) | (vix_proxy > 0.25)
+    regime_signals['inflation'] = (inf_proxy > 0.05)
     regime_signals['normal'] = ~(regime_signals['risk_on'] |
                                  regime_signals['risk_off'] |
                                  regime_signals['inflation'])
@@ -153,35 +155,29 @@ if price_data.shape[1] > 0:
         """
         Solve: max z s.t. w^T mu_r >= z for all regimes r,
                sum(w) = 1, w_i in [0, max_weight] if long_only
-        Interpretation: find weights that maximize guaranteed minimum
-        expected return across all market regimes.
         """
         n_assets = mu_reg.shape[1]
         n_regimes = mu_reg.shape[0]
 
-        # Objective: maximize z (minimized version: minimize -z)
         c = np.zeros(n_assets + 1)
-        c[-1] = -1  # coefficient on z (we minimize -z = maximize z)
+        c[-1] = -1
 
-        # Inequality constraints: w^T mu_r >= z => -w^T mu_r + z <= 0
         A_ub = []
         b_ub = []
         for r in range(n_regimes):
             row = np.zeros(n_assets + 1)
-            row[:n_assets] = -mu_reg[r]  # -mu_r
-            row[-1] = 1                  # +z
+            row[:n_assets] = -mu_reg[r]
+            row[-1] = 1
             A_ub.append(row)
             b_ub.append(0)
 
         A_ub = np.array(A_ub)
         b_ub = np.array(b_ub)
 
-        # Equality constraint: sum(w) = 1
         A_eq = np.zeros((1, n_assets + 1))
         A_eq[0, :n_assets] = 1
         b_eq = np.array([1])
 
-        # Bounds: w_i in [0, max_weight], z unbounded
         if long_only:
             bounds = [(0, max_weight) for _ in range(n_assets)] + [(None, None)]
         else:
@@ -193,7 +189,6 @@ if price_data.shape[1] > 0:
 
         return res
 
-    # Solve long-only version
     print("\n[Solving long-only GTO portfolio...]")
     res = solve_maximin_gto(mu_reg, long_only=True, max_weight=0.15)
 
@@ -209,11 +204,10 @@ if price_data.shape[1] > 0:
         print(f"\n{'Asset':<8} {'Weight':>10} {'Interpretation':>35}")
         print("-" * 70)
 
-        # Sort by weight descending
         idx_sorted = np.argsort(-w_opt)
         for idx in idx_sorted:
             w = w_opt[idx]
-            if w > 0.001:  # only show non-tiny positions
+            if w > 0.001:
                 interp = "diversifier" if w < 0.05 else "core holding" if w < 0.12 else "major position"
                 print(f"{asset_names[idx]:<8} {w:>9.2%}  {interp:>35}")
 
@@ -241,84 +235,261 @@ if price_data.shape[1] > 0:
     else:
         print(f"Optimization failed: {res.message}")
 
-
     # ====================================
-    # BACKTEST GTO PORTFOLIO
+    # STABILITY ANALYSIS: IS vs OOS
     # ====================================
     print("\n" + "="*70)
-    print("BACKTEST: GTO vs BENCHMARKS")
+    print("STABILITY ANALYSIS FRAMEWORK")
     print("="*70)
 
-    # GTO weights (from optimization)
-    w_gto = np.zeros(len(asset_names))
-    w_gto[asset_names.index('NG')]  = 0.15
-    w_gto[asset_names.index('EUR')] = 0.15
-    w_gto[asset_names.index('GC')]  = 0.15
-    w_gto[asset_names.index('GBP')] = 0.15
-    w_gto[asset_names.index('ZN')]  = 0.15
-    w_gto[asset_names.index('ZB')]  = 0.15
-    w_gto[asset_names.index('JPY')] = 0.10
+    # Time split
+    split_date = '2020-12-31'
+    is_idx = daily_returns.index <= split_date
+    oos_idx = daily_returns.index > split_date
 
-    # Equal weight benchmark
-    w_ew = np.ones(len(asset_names)) / len(asset_names)
+    print(f"\nIn-Sample:     {daily_returns.index[is_idx][0].date()} to {daily_returns.index[is_idx][-1].date()} ({is_idx.sum()} days)")
+    print(f"Out-of-Sample: {daily_returns.index[oos_idx][0].date()} to {daily_returns.index[oos_idx][-1].date()} ({oos_idx.sum()} days)")
 
-    # 60/40 benchmark (60% equity, 40% bonds)
-    w_6040 = np.zeros(len(asset_names))
-    eq_assets = ['ES', 'NQ', 'RTY']  # equity proxies
-    bond_assets = ['ZN', 'ZB']       # bond proxies
-    for a in eq_assets:
-        w_6040[asset_names.index(a)] = 0.60 / len(eq_assets)
-    for a in bond_assets:
-        w_6040[asset_names.index(a)] = 0.40 / len(bond_assets)
+    # ====================================
+    # 1. REGIME DISTRIBUTION STABILITY
+    # ====================================
+    print("\n" + "="*70)
+    print("1. REGIME DISTRIBUTION STABILITY")
+    print("="*70)
 
-    # Compute returns (use regime-labeled data)
-    # Align indices: use the daily_returns that's properly synchronized
-    daily_ret_aligned = daily_returns.copy()
+    regime_id_is = regime_id[is_idx]
+    regime_id_oos = regime_id[oos_idx]
 
-    gto_returns = (w_gto * daily_ret_aligned).sum(axis=1)
-    ew_returns = (w_ew * daily_ret_aligned).sum(axis=1)
-    b6040_returns = (w_6040 * daily_ret_aligned).sum(axis=1)
+    def compute_regime_dist(regime_id_period):
+        counts = regime_id_period.value_counts(normalize=True)
+        dist = np.zeros(4)
+        for r in range(4):
+            dist[r] = counts.get(r, 0.0)
+        return dist
 
-    def backtest_metrics(ret_series, name):
-        ret = ret_series.dropna()
-        if len(ret) == 0:
+    regime_dist_is = compute_regime_dist(regime_id_is)
+    regime_dist_oos = compute_regime_dist(regime_id_oos)
+
+    kl_div = jensenshannon(regime_dist_is, regime_dist_oos)
+
+    print("\nRegime Distribution IS:")
+    for r in range(4):
+        print(f"  {regime_names[r]:<12}: {regime_dist_is[r]*100:>5.1f}%")
+
+    print("\nRegime Distribution OOS:")
+    for r in range(4):
+        print(f"  {regime_names[r]:<12}: {regime_dist_oos[r]*100:>5.1f}%")
+
+    print(f"\nJensen-Shannon Divergence: {kl_div:.4f}")
+    print(f"  Interpretation: 0.0 = identical, 0.5+ = major shift")
+    if kl_div < 0.1:
+        print(f"  ✓ STABLE: Regime distributions similar across periods")
+        regime_dist_stable = True
+    else:
+        print(f"  ⚠ UNSTABLE: Regime distribution shifts significantly")
+        regime_dist_stable = False
+
+    # ====================================
+    # 2. CONDITIONAL RETURNS STABILITY
+    # ====================================
+    print("\n" + "="*70)
+    print("2. REGIME-CONDITIONAL RETURNS STABILITY")
+    print("="*70)
+
+    def get_regime_returns(daily_ret, regime_id_period, n_regimes=4):
+        mu_reg = np.zeros((n_regimes, daily_ret.shape[1]))
+        for r in range(n_regimes):
+            mask = regime_id_period == r
+            if mask.sum() > 50:
+                mu_reg[r] = daily_ret[mask].mean() * 252
+        return mu_reg
+
+    mu_is = get_regime_returns(daily_returns[is_idx], regime_id_is)
+    mu_oos = get_regime_returns(daily_returns[oos_idx], regime_id_oos)
+
+    print("\nAverage Asset Return per Regime (IS vs OOS):")
+    print(f"{'Regime':<12} {'IS Avg':>10} {'OOS Avg':>10} {'Drift':>10}")
+    print("-" * 50)
+    for r in range(4):
+        ret_is = mu_is[r].mean()
+        ret_oos = mu_oos[r].mean()
+        drift = ret_oos - ret_is
+        print(f"{regime_names[r]:<12} {ret_is*100:>9.2f}% {ret_oos*100:>9.2f}% {drift*100:>9.2f}%")
+
+    corr_is_oos = np.corrcoef(mu_is.flatten(), mu_oos.flatten())[0, 1]
+    print(f"\nCorrelation of mu_IS vs mu_OOS across all assets/regimes: {corr_is_oos:.3f}")
+    if corr_is_oos > 0.8:
+        print("  ✓ STABLE: Return patterns persist OOS")
+        returns_stable = True
+    else:
+        print("  ⚠ UNSTABLE: Return patterns shift significantly")
+        returns_stable = False
+
+    # ====================================
+    # 3. GTO WEIGHTS STABILITY
+    # ====================================
+    print("\n" + "="*70)
+    print("3. GTO PORTFOLIO STABILITY")
+    print("="*70)
+
+    res_is = solve_maximin_gto(mu_is)
+    res_oos = solve_maximin_gto(mu_oos)
+
+    w_is = res_is.x[:len(asset_names)] if res_is.success else np.ones(len(asset_names))/len(asset_names)
+    w_oos = res_oos.x[:len(asset_names)] if res_oos.success else np.ones(len(asset_names))/len(asset_names)
+
+    z_is = res_is.x[-1] if res_is.success else 0
+    z_oos = res_oos.x[-1] if res_oos.success else 0
+
+    print("\nGTO Weights Stability (top positions):")
+    print(f"{'Asset':<8} {'IS Weight':>12} {'OOS Weight':>12} {'Drift':>10}")
+    print("-" * 50)
+    for i in np.argsort(-w_is)[:7]:
+        if w_is[i] > 0.01:
+            drift = w_oos[i] - w_is[i]
+            print(f"{asset_names[i]:<8} {w_is[i]:>11.2%} {w_oos[i]:>11.2%} {drift:>9.2%}")
+
+    w_correlation = np.corrcoef(w_is, w_oos)[0, 1]
+    print(f"\nWeight correlation IS vs OOS: {w_correlation:.3f}")
+    if w_correlation > 0.7:
+        print("  ✓ STABLE: Optimal weights stable across periods")
+        weights_stable = True
+    else:
+        print("  ⚠ UNSTABLE: Weight allocation shifts significantly")
+        weights_stable = False
+
+    print(f"\nGuaranteed Min Return (Maximin z):")
+    print(f"  IS: {z_is*100:.2f}%")
+    print(f"  OOS: {z_oos*100:.2f}%")
+    print(f"  Drift: {(z_oos - z_is)*100:.2f}%")
+
+    # ====================================
+    # 4. DECOMPOSED EDGE STABILITY
+    # ====================================
+    print("\n" + "="*70)
+    print("4. DECOMPOSED EDGE ANALYSIS")
+    print("  E[PnL] = (Avg Winner × P(Win)) + (Avg Loser × P(Loss))")
+    print("="*70)
+
+    def compute_edge_metrics(portfolio_returns):
+        ret = portfolio_returns.dropna()
+        
+        win_mask = ret > 0
+        loss_mask = ret < 0
+        
+        if win_mask.sum() == 0 or loss_mask.sum() == 0:
             return None
-        cum = (1 + ret).cumprod()
-        years = len(ret) / 252.0
-        ann_ret = cum.iloc[-1]**(1 / years) - 1 if years > 0 else 0
-        vol = ret.std() * np.sqrt(252)
-        sharpe = ann_ret / vol if vol > 0 else 0
-        running_max = cum.cummax()
-        dd = (cum - running_max) / running_max
-        max_dd = dd.min()
+        
+        avg_win = ret[win_mask].mean()
+        avg_loss = ret[loss_mask].mean()
+        p_win = win_mask.sum() / len(ret)
+        p_loss = loss_mask.sum() / len(ret)
+        
+        exp_pnl = (avg_win * p_win) + (avg_loss * p_loss)
+        
         return {
-            'name': name,
-            'ann_ret': ann_ret,
-            'vol': vol,
-            'sharpe': sharpe,
-            'max_dd': max_dd,
-            'cum_final': cum.iloc[-1]
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'p_win': p_win,
+            'p_loss': p_loss,
+            'exp_pnl': exp_pnl,
+            'win_loss_ratio': abs(avg_win / avg_loss) if avg_loss != 0 else 0
         }
 
-    gto_metrics = backtest_metrics(gto_returns, "GTO Portfolio")
-    ew_metrics = backtest_metrics(ew_returns, "Equal Weight")
-    b6040_metrics = backtest_metrics(b6040_returns, "60/40 Benchmark")
+    gto_ret_is = (w_is * daily_returns[is_idx]).sum(axis=1)
+    gto_ret_oos = (w_is * daily_returns[oos_idx]).sum(axis=1)
 
-    print(f"\n{'Strategy':<20} {'Ann Return':>12} {'Vol':>10} {'Sharpe':>10} {'Max DD':>12}")
-    print("-" * 70)
+    edge_is = compute_edge_metrics(gto_ret_is)
+    edge_oos = compute_edge_metrics(gto_ret_oos)
 
-    for m in [gto_metrics, ew_metrics, b6040_metrics]:
-        if m:
-            print(f"{m['name']:<20} {m['ann_ret']:>11.2%} {m['vol']:>9.2%} {m['sharpe']:>9.2f} {m['max_dd']:>11.2%}")
+    print("\nEdge Components (using IS-optimized weights):")
+    print(f"{'Metric':<20} {'IS':>12} {'OOS':>12} {'Drift':>12}")
+    print("-" * 60)
 
-    print("\n" + "-" * 70)
-    print("Interpretation:")
-    print(f"  GTO Sharpe: {gto_metrics['sharpe']:.2f}")
-    print(f"  vs 60/40:   {b6040_metrics['sharpe']:.2f}")
-    print(f"  Advantage:  {(gto_metrics['sharpe'] - b6040_metrics['sharpe']):.2f} Sharpe points")
-    print(f"\n  GTO guarantees non-negative return across regimes.")
-    print(f"  60/40 is hit hard in Risk-Off / Inflation scenarios.")
+    for key in ['avg_win', 'avg_loss', 'p_win', 'p_loss', 'exp_pnl', 'win_loss_ratio']:
+        is_val = edge_is[key]
+        oos_val = edge_oos[key]
+        drift = oos_val - is_val
+        
+        if key == 'exp_pnl':
+            print(f"{key:<20} {is_val*100:>11.2f}% {oos_val*100:>11.2f}% {drift*100:>11.2f}%")
+        elif 'p_' in key:
+            print(f"{key:<20} {is_val*100:>11.1f}% {oos_val*100:>11.1f}% {drift*100:>11.1f}%")
+        else:
+            print(f"{key:<20} {is_val*100:>11.2f}% {oos_val*100:>11.2f}% {drift*100:>11.2f}%")
 
+    edge_stability = abs((edge_oos['exp_pnl'] - edge_is['exp_pnl']) / (abs(edge_is['exp_pnl']) + 1e-8))
+    print(f"\nE[PnL] relative drift: {edge_stability*100:.1f}%")
+    if edge_stability < 0.25:
+        print("  ✓ STABLE: Expected value of trade stable OOS")
+        edge_stable = True
+    else:
+        print("  ⚠ UNSTABLE: Edge degrades significantly out-of-sample")
+        edge_stable = False
+
+    # ====================================
+    # 5. OVERALL STABILITY VERDICT
+    # ====================================
     print("\n" + "="*70)
-    print("ANALYSIS COMPLETE")
+    print("STABILITY SCORECARD")
     print("="*70)
+
+    stability_scores = {
+        'Regime Distribution (KL)': regime_dist_stable,
+        'Return Correlations': returns_stable,
+        'Weight Stability': weights_stable,
+        'Edge Persistence': edge_stable
+    }
+
+    for check, passed in stability_scores.items():
+        status = "✓ PASS" if passed else "⚠ FAIL"
+        print(f"{check:<35} {status}")
+
+    n_pass = sum(stability_scores.values())
+    n_total = len(stability_scores)
+    print(f"\nOverall: {n_pass}/{n_total} stability checks passed")
+
+    if n_pass >= 3:
+        print("\n→ VERDICT: Strategy shows reasonable stability.")
+        print("  Edge and P/L distributions persist out-of-sample.")
+        print("  Can proceed to performance metrics (Sharpe, drawdown) as secondary validation.")
+        is_stable = True
+    else:
+        print("\n→ VERDICT: Strategy lacks sufficient stability.")
+        print("  Edge degrades significantly out-of-sample.")
+        print("  Performance metrics alone are unreliable. Needs redesign.")
+        is_stable = False
+
+    # ====================================
+    # 6. SECONDARY PERFORMANCE METRICS
+    # ====================================
+    if is_stable:
+        print("\n" + "="*70)
+        print("SECONDARY PERFORMANCE METRICS (supporting evidence only)")
+        print("="*70)
+        
+        def compute_perf_metrics(ret_series):
+            ret = ret_series.dropna()
+            if len(ret) == 0:
+                return None
+            cum = (1 + ret).cumprod()
+            years = len(ret) / 252.0
+            ann_ret = cum.iloc[-1]**(1/years) - 1 if years > 0 else 0
+            vol = ret.std() * np.sqrt(252)
+            sharpe = ann_ret / vol if vol > 0 else 0
+            dd = (cum / cum.cummax() - 1).min()
+            return {'ret': ann_ret, 'vol': vol, 'sharpe': sharpe, 'dd': dd}
+        
+        perf_is = compute_perf_metrics(gto_ret_is)
+        perf_oos = compute_perf_metrics(gto_ret_oos)
+        
+        print(f"\n{'Metric':<15} {'IS':>12} {'OOS':>12} {'Drift':>12}")
+        print("-" * 55)
+        print(f"{'Ann Return':<15} {perf_is['ret']*100:>11.2f}% {perf_oos['ret']*100:>11.2f}% {(perf_oos['ret']-perf_is['ret'])*100:>11.2f}%")
+        print(f"{'Volatility':<15} {perf_is['vol']*100:>11.2f}% {perf_oos['vol']*100:>11.2f}% {(perf_oos['vol']-perf_is['vol'])*100:>11.2f}%")
+        print(f"{'Sharpe':<15} {perf_is['sharpe']:>11.2f} {perf_oos['sharpe']:>11.2f} {perf_oos['sharpe']-perf_is['sharpe']:>11.2f}")
+        print(f"{'Max DD':<15} {perf_is['dd']*100:>11.2f}% {perf_oos['dd']*100:>11.2f}% {(perf_oos['dd']-perf_is['dd'])*100:>11.2f}%")
+
+print("\n" + "="*70)
+print("ANALYSIS COMPLETE")
+print("="*70)
