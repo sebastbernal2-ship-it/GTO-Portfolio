@@ -73,40 +73,93 @@ if price_data.shape[1] > 0:
     price_data_etf.columns = etf_cols
     daily_returns_etf = price_data_etf.pct_change()
 
+   
+
+
+   
+   
     # ====================================
-    # REGIME LABELING (LOOSENED THRESHOLDS)
+    # IMPROVED REGIME DETECTION (Forward-Looking Signals)
     # ====================================
     print("\n" + "="*70)
-    print("REGIME DETECTION")
+    print("REGIME DETECTION (Forward-Looking Signals)")
     print("="*70)
 
-    # Backward-looking indicators
-    eq_ret_12m = daily_returns_etf[['SPY', 'QQQ', 'IWM']].mean(axis=1).rolling(252).mean() * 252
-    vix_proxy  = daily_returns_etf['SPY'].rolling(60).std() * np.sqrt(252) * 10
-    inf_proxy  = daily_returns_etf[['USO', 'GLD', 'CPER']].mean(axis=1).rolling(60).mean() * 252 * 100
+    # Forward-looking regime indicators
+    yc_ret_long = daily_returns_etf['TLT'].rolling(20).mean() * 252
+    yc_ret_short = daily_returns_etf['IEF'].rolling(20).mean() * 252
+    yc_slope = yc_ret_long - yc_ret_short
+    
+    bond_momentum_20d = daily_returns_etf['TLT'].rolling(20).sum()
+    bond_momentum_60d = daily_returns_etf['TLT'].rolling(60).sum()
+    term_spread = bond_momentum_20d - bond_momentum_60d
+    
+    equity_momentum = daily_returns_etf[['SPY', 'QQQ', 'IWM']].mean(axis=1).rolling(20).mean()
+    safe_momentum = (daily_returns_etf['TLT'].rolling(20).mean() + 
+                     daily_returns_etf['FXY'].rolling(20).mean()) / 2
+    credit_spread = equity_momentum - safe_momentum
+    
+    commodity_momentum = daily_returns_etf[['USO', 'GLD', 'CPER']].mean(axis=1).rolling(30).mean()
+    gold_premium = daily_returns_etf['GLD'].rolling(60).mean() - daily_returns_etf['IEF'].rolling(60).mean()
+    
+    realized_vol = daily_returns_etf['SPY'].rolling(30).std() * np.sqrt(252)
+    vol_zscore = (realized_vol - realized_vol.rolling(120).mean()) / realized_vol.rolling(120).std()
 
-    # LOOSENED THRESHOLDS for balanced regime split
     regime_signals = pd.DataFrame(index=daily_returns_etf.index)
-    regime_signals['risk_on']  = (eq_ret_12m > 0.05)
-    regime_signals['risk_off'] = (eq_ret_12m < -0.02) | (vix_proxy > 0.25)
-    regime_signals['inflation'] = (inf_proxy > 0.05)
-    regime_signals['normal'] = ~(regime_signals['risk_on'] |
-                                 regime_signals['risk_off'] |
-                                 regime_signals['inflation'])
+    regime_signals['risk_on'] = (
+        (credit_spread > credit_spread.rolling(60).mean()) &
+        (equity_momentum > 0.005) &
+        (bond_momentum_20d < 0.02)
+    )
+    regime_signals['risk_off'] = (
+        (credit_spread < credit_spread.rolling(60).mean()) &
+        (bond_momentum_20d > bond_momentum_60d) &
+        (vol_zscore > 0.5)
+    )
+    regime_signals['inflation'] = (
+        (commodity_momentum > commodity_momentum.rolling(60).mean()) &
+        (gold_premium > 0) &
+        (yc_slope < 0)
+    )
+    regime_signals['normal'] = ~(
+        regime_signals['risk_on'] | regime_signals['risk_off'] | regime_signals['inflation']
+    )
 
-    # Assign: priority order risk-off > inflation > risk-on > normal
-    regime_id = pd.Series(3, index=daily_returns_etf.index)  # default normal
+    regime_id = pd.Series(3, index=daily_returns_etf.index)
     regime_id[regime_signals['risk_off']] = 1
     regime_id[regime_signals['inflation']] = 2
     regime_id[regime_signals['risk_on']] = 0
 
     regime_names = {0: 'Risk-On', 1: 'Risk-Off', 2: 'Inflation', 3: 'Normal'}
 
-    print("\nRegime Balance:")
+    print("\nRegime Balance (Forward-Looking):")
     for r in range(4):
         count = (regime_id == r).sum()
         pct = count / len(regime_id) * 100
         print(f"  {regime_names[r]:<12}: {pct:>5.1f}% ({count:>5d} days)")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   
 
     # ====================================
     # REGIME-CONDITIONAL STATS
