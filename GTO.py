@@ -1,7 +1,7 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from scipy.optimize import linprog
 from scipy.spatial.distance import jensenshannon
 from sklearn.cluster import KMeans
@@ -80,108 +80,67 @@ if price_data.shape[1] > 0:
     price_data_etf.columns = etf_cols
     daily_returns_etf = price_data_etf.pct_change()
 
-    # ====================================
-    # K-MEANS REGIME DETECTION
-    # ====================================
-    print("\n" + "="*70)
-    print("REGIME DETECTION (K-MEANS CLUSTERING)")
-    print("="*70)
-
-    print("\n[Building regime features...]")
-    
-    # Yield curve slope
-    yc_ret_long = daily_returns_etf['TLT'].rolling(20).mean() * 252
-    yc_ret_short = daily_returns_etf['IEF'].rolling(20).mean() * 252
-    yc_slope = yc_ret_long - yc_ret_short
-    
-    # Equity momentum
-    equity_momentum = daily_returns_etf[['SPY', 'QQQ', 'IWM']].mean(axis=1).rolling(20).mean()
-    
-    # Commodity momentum
-    commodity_momentum = daily_returns_etf[['USO', 'GLD', 'CPER']].mean(axis=1).rolling(30).mean()
-    
-    # Realized volatility
-    realized_vol = daily_returns_etf['SPY'].rolling(30).std() * np.sqrt(252)
-
-    # Stack and standardize
-    features = np.column_stack([
-        yc_slope.fillna(0),
-        equity_momentum.fillna(0),
-        commodity_momentum.fillna(0),
-        realized_vol.fillna(0)
-    ])
-
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-
-    # K-Means
-    print("[Running K-means with 4 clusters...]")
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-    regime_id_raw = kmeans.fit_predict(features_scaled)
-    regime_id = pd.Series(regime_id_raw, index=daily_returns_etf.index)
-
-    # Relabel by equity momentum (0=risk-on, 3=risk-off)
-    regime_equity_momentum = [equity_momentum[regime_id == r].mean() for r in range(4)]
-    regime_order = np.argsort(regime_equity_momentum)[::-1]
-    regime_relabel = {old: new for new, old in enumerate(regime_order)}
-    regime_id = regime_id.map(regime_relabel)
-
+    asset_names = price_data.columns.tolist()
+    n_regimes = 4
     regime_names = {0: 'Risk-On', 1: 'Risk-Mid', 2: 'Risk-Low', 3: 'Risk-Off'}
 
-    print("\nRegime Balance (K-Means):")
-    for r in range(4):
-        count = (regime_id == r).sum()
-        pct = count / len(regime_id) * 100
-        print(f"  {regime_names[r]:<12}: {pct:>5.1f}% ({count:>5d} days)")
-
     # ====================================
-    # REGIME-CONDITIONAL EXPECTED RETURNS
-    # ====================================
-    print("\nRegime-Conditional Expected Returns (ann %):")
-    print("-" * 70)
-
-    n_regimes = 4
-    mu_reg = np.zeros((n_regimes, daily_returns.shape[1]))
-    sigma_reg = np.zeros((n_regimes, daily_returns.shape[1], daily_returns.shape[1]))
-    asset_names = price_data.columns.tolist()
-
-    for r in range(n_regimes):
-        mask = regime_id == r
-        if mask.sum() > 252:
-            ret_reg = daily_returns[mask]
-            mu_reg[r] = ret_reg.mean() * 252
-            sigma_reg[r] = ret_reg.cov() * 252
-
-    print(f"\n{'Asset':<8}", end='')
-    for r in range(4):
-        print(f"{regime_names[r]:>12}", end='')
-    print()
-    print("-" * 70)
-
-    for i, asset in enumerate(asset_names):
-        print(f"{asset:<8}", end='')
-        for r in range(4):
-            print(f"{mu_reg[r, i]*100:>11.1f}%", end='')
-        print()
-
-    print("-" * 70)
-    print("Avg Return per Regime:")
-    for r in range(4):
-        avg_ret = mu_reg[r].mean()
-        print(f"  {regime_names[r]:<12}: {avg_ret*100:>6.2f}%")
-
-    # ====================================
-    # GTO MAXIMIN OPTIMIZATION
+    # ROLLING K-MEANS REGIME DETECTION
     # ====================================
     print("\n" + "="*70)
-    print("GTO-INSPIRED PORTFOLIO (K-MEANS REGIMES)")
+    print("ROLLING-WINDOW GTO: COMPLETE ANALYSIS")
     print("="*70)
 
-    def solve_maximin_gto(mu_reg, long_only=True, max_weight=0.15):
-        """Maximin: max z s.t. w^T mu_r >= z for all regimes r"""
-        n_assets = mu_reg.shape[1]
-        n_regimes = mu_reg.shape[0]
+    def get_regimes_at_date(daily_ret_etf, end_date, lookback_days=252*2):
+        """Cluster regimes using data up to end_date with lookback"""
+        start_date = end_date - timedelta(days=lookback_days)
+        data_slice = daily_ret_etf[start_date:end_date]
+        
+        if len(data_slice) < 252:
+            return None, None
 
+        # Features
+        yc_ret_long = data_slice['TLT'].rolling(20).mean() * 252
+        yc_ret_short = data_slice['IEF'].rolling(20).mean() * 252
+        yc_slope = yc_ret_long - yc_ret_short
+        
+        equity_momentum = data_slice[['SPY', 'QQQ', 'IWM']].mean(axis=1).rolling(20).mean()
+        commodity_momentum = data_slice[['USO', 'GLD', 'CPER']].mean(axis=1).rolling(30).mean()
+        realized_vol = data_slice['SPY'].rolling(30).std() * np.sqrt(252)
+
+        features = np.column_stack([
+            yc_slope.fillna(0),
+            equity_momentum.fillna(0),
+            commodity_momentum.fillna(0),
+            realized_vol.fillna(0)
+        ])
+
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+
+        kmeans = KMeans(n_clusters=4, random_state=42, n_init=5)
+        regime_id_raw = kmeans.fit_predict(features_scaled)
+        
+        # Relabel
+        regime_eq_mom = [equity_momentum[regime_id_raw == r].mean() for r in range(4)]
+        regime_order = np.argsort(regime_eq_mom)[::-1]
+        regime_relabel = {old: new for new, old in enumerate(regime_order)}
+        regime_id = np.array([regime_relabel[r] for r in regime_id_raw])
+        
+        return regime_id, data_slice.index
+
+    def get_regime_returns(daily_ret, regime_id):
+        """Compute mu_r for regime_id"""
+        mu_reg = np.zeros((n_regimes, daily_ret.shape[1]))
+        for r in range(n_regimes):
+            mask = regime_id == r
+            if mask.sum() > 50:
+                mu_reg[r] = daily_ret[mask].mean() * 252
+        return mu_reg
+
+    def solve_maximin_gto(mu_reg, max_weight=0.15):
+        """Maximin optimization"""
+        n_assets = mu_reg.shape[1]
         c = np.zeros(n_assets + 1)
         c[-1] = -1
 
@@ -201,316 +160,342 @@ if price_data.shape[1] > 0:
         A_eq[0, :n_assets] = 1
         b_eq = np.array([1])
 
-        if long_only:
-            bounds = [(0, max_weight) for _ in range(n_assets)] + [(None, None)]
-        else:
-            bounds = [(-max_weight, max_weight) for _ in range(n_assets)] + [(None, None)]
+        bounds = [(0, max_weight) for _ in range(n_assets)] + [(None, None)]
 
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
                       bounds=bounds, method='highs')
 
         return res
 
-    print("\n[Solving long-only GTO portfolio...]")
-    res = solve_maximin_gto(mu_reg, long_only=True, max_weight=0.15)
+    # ====================================
+    # ROLLING WINDOW OPTIMIZATION
+    # ====================================
+    print("\n[Running rolling-window optimization...]")
+    print("[Reoptimizing every 60 trading days]")
+    print("[Using 2-year lookback for regime detection]\n")
 
-    if res.success:
-        w_opt = res.x[:len(asset_names)]
-        z_opt = res.x[-1]
-        regime_payoffs = mu_reg @ w_opt
+    # Parameters
+    reopt_freq = 60
+    lookback = 252 * 2
 
-        print("\n" + "="*70)
-        print("GTO PORTFOLIO (LONG-ONLY, MAX-MIN OPTIMIZATION)")
-        print("="*70)
+    # Storage
+    rolling_weights = {}
+    rolling_regimes = {}
 
-        print(f"\n{'Asset':<8} {'Weight':>10} {'Interpretation':>35}")
-        print("-" * 70)
+    # Iterate through dates
+    optimization_dates = []
+    for idx, date in enumerate(daily_returns.index[lookback:]):
+        if (idx + 1) % reopt_freq == 0:
+            optimization_dates.append(date)
+            if len(optimization_dates) > 50:
+                break
 
-        idx_sorted = np.argsort(-w_opt)
-        for idx in idx_sorted:
-            w = w_opt[idx]
-            if w > 0.001:
-                interp = "diversifier" if w < 0.05 else "core holding" if w < 0.12 else "major position"
-                print(f"{asset_names[idx]:<8} {w:>9.2%}  {interp:>35}")
+    print(f"Optimizing at {len(optimization_dates)} dates:")
+    for opt_date in optimization_dates[:10]:
+        print(f"  {opt_date.date()}")
+    if len(optimization_dates) > 10:
+        print(f"  ... ({len(optimization_dates) - 10} more)")
 
-        print("\n" + "-" * 70)
-        print("PAYOFF MATRIX (Expected return in each regime):")
-        print("-" * 70)
-        print(f"{'Regime':<12} {'Return':>10} {'Interpretation':>45}")
-        print("-" * 70)
-        for r in range(n_regimes):
-            payoff = regime_payoffs[r]
-            print(f"{regime_names[r]:<12} {payoff*100:>9.2f}%", end='')
-            if payoff == regime_payoffs.min():
-                print(f"  <-- GUARANTEED MIN")
-            elif payoff == regime_payoffs.max():
-                print(f"  <-- BEST CASE")
-            else:
-                print()
+    for opt_date in optimization_dates:
+        regime_id, regime_dates = get_regimes_at_date(daily_returns_etf, opt_date, lookback_days=lookback)
+        if regime_id is None:
+            continue
 
-        print("-" * 70)
-        print(f"\nGUARANTEED MINIMUM RETURN: {z_opt*100:.2f}%")
-        print(f"WORST-CASE REGIME: {regime_names[np.argmin(regime_payoffs)]}")
+        data_for_mu = daily_returns.loc[regime_dates]
+        mu_reg = get_regime_returns(data_for_mu, regime_id)
 
-    else:
-        print(f"Optimization failed: {res.message}")
-        w_opt = np.ones(len(asset_names)) / len(asset_names)
-        z_opt = 0
+        res = solve_maximin_gto(mu_reg)
+        if res.success:
+            w = res.x[:len(asset_names)]
+        else:
+            w = np.ones(len(asset_names)) / len(asset_names)
+
+        rolling_weights[opt_date] = w
+        rolling_regimes[opt_date] = regime_id
 
     # ====================================
-    # STABILITY ANALYSIS: IS vs OOS
+    # BACKTEST WITH ROLLING WEIGHTS
     # ====================================
     print("\n" + "="*70)
-    print("STABILITY ANALYSIS FRAMEWORK (K-MEANS REGIMES)")
+    print("BACKTEST: ROLLING-WINDOW GTO VS STATIC GTO")
     print("="*70)
 
     split_date = '2020-12-31'
     is_idx = daily_returns.index <= split_date
     oos_idx = daily_returns.index > split_date
 
-    print(f"\nIn-Sample:     {daily_returns.index[is_idx][0].date()} to {daily_returns.index[is_idx][-1].date()} ({is_idx.sum()} days)")
-    print(f"Out-of-Sample: {daily_returns.index[oos_idx][0].date()} to {daily_returns.index[oos_idx][-1].date()} ({oos_idx.sum()} days)")
+    regime_id_is, regime_dates_is = get_regimes_at_date(daily_returns_etf, pd.Timestamp(split_date), lookback)
+    data_is = daily_returns.loc[regime_dates_is]
+    mu_is = get_regime_returns(data_is, regime_id_is)
+    res_static = solve_maximin_gto(mu_is)
+    w_static = res_static.x[:len(asset_names)]
 
-    # ====================================
-    # 1. REGIME DISTRIBUTION STABILITY
-    # ====================================
-    print("\n" + "="*70)
-    print("1. REGIME DISTRIBUTION STABILITY")
-    print("="*70)
+    # Static portfolio
+    oos_data = daily_returns[oos_idx]
+    static_portfolio_ret = (w_static * oos_data).sum(axis=1)
 
-    regime_id_is = regime_id[is_idx]
-    regime_id_oos = regime_id[oos_idx]
+    # Rolling portfolio
+    rolling_portfolio_ret = []
+    rolling_dates = []
 
-    def compute_regime_dist(regime_id_period):
-        counts = regime_id_period.value_counts(normalize=True)
-        dist = np.zeros(4)
-        for r in range(4):
-            dist[r] = counts.get(r, 0.0)
-        return dist
+    for i, date in enumerate(daily_returns.index):
+        opt_dates_before = [d for d in rolling_weights.keys() if d <= date]
+        if opt_dates_before:
+            closest_opt_date = max(opt_dates_before)
+            w_roll = rolling_weights[closest_opt_date]
+            daily_ret = daily_returns.loc[date]
+            port_ret = (w_roll * daily_ret).sum()
+            rolling_portfolio_ret.append(port_ret)
+            rolling_dates.append(date)
 
-    regime_dist_is = compute_regime_dist(regime_id_is)
-    regime_dist_oos = compute_regime_dist(regime_id_oos)
+    rolling_portfolio_ret = pd.Series(rolling_portfolio_ret, index=rolling_dates)
 
-    kl_div = jensenshannon(regime_dist_is, regime_dist_oos)
-
-    print("\nRegime Distribution IS:")
-    for r in range(4):
-        print(f"  {regime_names[r]:<12}: {regime_dist_is[r]*100:>5.1f}%")
-
-    print("\nRegime Distribution OOS:")
-    for r in range(4):
-        print(f"  {regime_names[r]:<12}: {regime_dist_oos[r]*100:>5.1f}%")
-
-    print(f"\nJensen-Shannon Divergence: {kl_div:.4f}")
-    print(f"  Interpretation: 0.0 = identical, 0.5+ = major shift")
-    if kl_div < 0.1:
-        print(f"  ✓ STABLE: Regime distributions similar across periods")
-        regime_dist_stable = True
-    else:
-        print(f"  ⚠ UNSTABLE: Regime distribution shifts significantly")
-        regime_dist_stable = False
-
-    # ====================================
-    # 2. CONDITIONAL RETURNS STABILITY
-    # ====================================
-    print("\n" + "="*70)
-    print("2. REGIME-CONDITIONAL RETURNS STABILITY")
-    print("="*70)
-
-    def get_regime_returns(daily_ret, regime_id_period, n_regimes=4):
-        mu_reg = np.zeros((n_regimes, daily_ret.shape[1]))
-        for r in range(n_regimes):
-            mask = regime_id_period == r
-            if mask.sum() > 50:
-                mu_reg[r] = daily_ret[mask].mean() * 252
-        return mu_reg
-
-    mu_is = get_regime_returns(daily_returns[is_idx], regime_id_is)
-    mu_oos = get_regime_returns(daily_returns[oos_idx], regime_id_oos)
-
-    print("\nAverage Asset Return per Regime (IS vs OOS):")
-    print(f"{'Regime':<12} {'IS Avg':>10} {'OOS Avg':>10} {'Drift':>10}")
-    print("-" * 50)
-    for r in range(4):
-        ret_is = mu_is[r].mean()
-        ret_oos = mu_oos[r].mean()
-        drift = ret_oos - ret_is
-        print(f"{regime_names[r]:<12} {ret_is*100:>9.2f}% {ret_oos*100:>9.2f}% {drift*100:>9.2f}%")
-
-    corr_is_oos = np.corrcoef(mu_is.flatten(), mu_oos.flatten())[0, 1]
-    print(f"\nCorrelation of mu_IS vs mu_OOS across all assets/regimes: {corr_is_oos:.3f}")
-    if corr_is_oos > 0.8:
-        print("  ✓ STABLE: Return patterns persist OOS")
-        returns_stable = True
-    else:
-        print("  ⚠ UNSTABLE: Return patterns shift significantly")
-        returns_stable = False
-
-    # ====================================
-    # 3. GTO WEIGHTS STABILITY
-    # ====================================
-    print("\n" + "="*70)
-    print("3. GTO PORTFOLIO STABILITY")
-    print("="*70)
-
-    res_is = solve_maximin_gto(mu_is)
-    res_oos = solve_maximin_gto(mu_oos)
-
-    w_is = res_is.x[:len(asset_names)] if res_is.success else np.ones(len(asset_names))/len(asset_names)
-    w_oos = res_oos.x[:len(asset_names)] if res_oos.success else np.ones(len(asset_names))/len(asset_names)
-
-    z_is = res_is.x[-1] if res_is.success else 0
-    z_oos = res_oos.x[-1] if res_oos.success else 0
-
-    print("\nGTO Weights Stability (top positions):")
-    print(f"{'Asset':<8} {'IS Weight':>12} {'OOS Weight':>12} {'Drift':>10}")
-    print("-" * 50)
-    for i in np.argsort(-w_is)[:7]:
-        if w_is[i] > 0.01:
-            drift = w_oos[i] - w_is[i]
-            print(f"{asset_names[i]:<8} {w_is[i]:>11.2%} {w_oos[i]:>11.2%} {drift:>9.2%}")
-
-    w_correlation = np.corrcoef(w_is, w_oos)[0, 1]
-    print(f"\nWeight correlation IS vs OOS: {w_correlation:.3f}")
-    if w_correlation > 0.7:
-        print("  ✓ STABLE: Optimal weights stable across periods")
-        weights_stable = True
-    else:
-        print("  ⚠ UNSTABLE: Weight allocation shifts significantly")
-        weights_stable = False
-
-    print(f"\nGuaranteed Min Return (Maximin z):")
-    print(f"  IS: {z_is*100:.2f}%")
-    print(f"  OOS: {z_oos*100:.2f}%")
-    print(f"  Drift: {(z_oos - z_is)*100:.2f}%")
-
-    # ====================================
-    # 4. DECOMPOSED EDGE STABILITY
-    # ====================================
-    print("\n" + "="*70)
-    print("4. DECOMPOSED EDGE ANALYSIS")
-    print("  E[PnL] = (Avg Winner × P(Win)) + (Avg Loser × P(Loss))")
-    print("="*70)
-
-    def compute_edge_metrics(portfolio_returns):
-        ret = portfolio_returns.dropna()
-        
-        win_mask = ret > 0
-        loss_mask = ret < 0
-        
-        if win_mask.sum() == 0 or loss_mask.sum() == 0:
+    # Metrics
+    def calc_metrics(ret_series):
+        ret = ret_series.dropna()
+        if len(ret) < 252:
             return None
-        
-        avg_win = ret[win_mask].mean()
-        avg_loss = ret[loss_mask].mean()
-        p_win = win_mask.sum() / len(ret)
-        p_loss = loss_mask.sum() / len(ret)
-        
-        exp_pnl = (avg_win * p_win) + (avg_loss * p_loss)
-        
-        return {
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'p_win': p_win,
-            'p_loss': p_loss,
-            'exp_pnl': exp_pnl,
-            'win_loss_ratio': abs(avg_win / avg_loss) if avg_loss != 0 else 0
-        }
+        cum = (1 + ret).cumprod()
+        years = len(ret) / 252.0
+        ann_ret = cum.iloc[-1]**(1/years) - 1
+        vol = ret.std() * np.sqrt(252)
+        sharpe = ann_ret / vol if vol > 0 else 0
+        running_max = cum.cummax()
+        dd = (cum - running_max) / running_max
+        max_dd = dd.min()
+        return {'ret': ann_ret, 'vol': vol, 'sharpe': sharpe, 'max_dd': max_dd}
 
-    gto_ret_is = (w_is * daily_returns[is_idx]).sum(axis=1)
-    gto_ret_oos = (w_is * daily_returns[oos_idx]).sum(axis=1)
+    metrics_static = calc_metrics(static_portfolio_ret)
+    metrics_rolling = calc_metrics(rolling_portfolio_ret)
 
-    edge_is = compute_edge_metrics(gto_ret_is)
-    edge_oos = compute_edge_metrics(gto_ret_oos)
-
-    print("\nEdge Components (using IS-optimized weights):")
-    print(f"{'Metric':<20} {'IS':>12} {'OOS':>12} {'Drift':>12}")
-    print("-" * 60)
-
-    for key in ['avg_win', 'avg_loss', 'p_win', 'p_loss', 'exp_pnl', 'win_loss_ratio']:
-        is_val = edge_is[key]
-        oos_val = edge_oos[key]
-        drift = oos_val - is_val
-        
-        if key == 'exp_pnl':
-            print(f"{key:<20} {is_val*100:>11.2f}% {oos_val*100:>11.2f}% {drift*100:>11.2f}%")
-        elif 'p_' in key:
-            print(f"{key:<20} {is_val*100:>11.1f}% {oos_val*100:>11.1f}% {drift*100:>11.1f}%")
-        else:
-            print(f"{key:<20} {is_val*100:>11.2f}% {oos_val*100:>11.2f}% {drift*100:>11.2f}%")
-
-    edge_stability = abs((edge_oos['exp_pnl'] - edge_is['exp_pnl']) / (abs(edge_is['exp_pnl']) + 1e-8))
-    print(f"\nE[PnL] relative drift: {edge_stability*100:.1f}%")
-    if edge_stability < 0.25:
-        print("  ✓ STABLE: Expected value of trade stable OOS")
-        edge_stable = True
-    else:
-        print("  ⚠ UNSTABLE: Edge degrades significantly out-of-sample")
-        edge_stable = False
+    print(f"\n{'Strategy':<25} {'Ann Ret':>12} {'Vol':>10} {'Sharpe':>10} {'Max DD':>12}")
+    print("-" * 70)
+    print(f"{'Static GTO (opt once)':<25} {metrics_static['ret']:>11.2%} {metrics_static['vol']:>9.2%} {metrics_static['sharpe']:>9.2f} {metrics_static['max_dd']:>11.2%}")
+    print(f"{'Rolling GTO (opt 60d)':<25} {metrics_rolling['ret']:>11.2%} {metrics_rolling['vol']:>9.2%} {metrics_rolling['sharpe']:>9.2f} {metrics_rolling['max_dd']:>11.2%}")
+    
+    print(f"\nImprovement (Rolling vs Static):")
+    print(f"  Sharpe: {metrics_rolling['sharpe'] - metrics_static['sharpe']:+.2f}")
+    print(f"  Return: {(metrics_rolling['ret'] - metrics_static['ret'])*100:+.1f} bps")
 
     # ====================================
-    # 5. OVERALL STABILITY VERDICT
+    # STABILITY ANALYSIS FRAMEWORK
     # ====================================
     print("\n" + "="*70)
-    print("STABILITY SCORECARD")
+    print("STABILITY ANALYSIS: IS VS OOS WITH ROLLING OPTIMIZATION")
     print("="*70)
 
-    stability_scores = {
-        'Regime Distribution (KL)': regime_dist_stable,
-        'Return Correlations': returns_stable,
-        'Weight Stability': weights_stable,
-        'Edge Persistence': edge_stable
+    # For rolling GTO, test stability by looking at performance in fixed windows
+    rolling_is_idx = rolling_portfolio_ret.index <= split_date
+    rolling_oos_idx = rolling_portfolio_ret.index > split_date
+
+    rolling_ret_is = rolling_portfolio_ret[rolling_is_idx]
+    rolling_ret_oos = rolling_portfolio_ret[rolling_oos_idx]
+
+    print(f"\nIn-Sample:     {rolling_ret_is.index[0].date()} to {rolling_ret_is.index[-1].date()} ({len(rolling_ret_is)} days)")
+    print(f"Out-of-Sample: {rolling_ret_oos.index[0].date()} to {rolling_ret_oos.index[-1].date()} ({len(rolling_ret_oos)} days)")
+
+    # ====================================
+    # CHECK 1: RETURN DISTRIBUTION STABILITY
+    # ====================================
+    print("\n" + "="*70)
+    print("1. RETURN DISTRIBUTION STABILITY (IS vs OOS)")
+    print("="*70)
+
+    mean_is = rolling_ret_is.mean() * 252
+    vol_is = rolling_ret_is.std() * np.sqrt(252)
+    sharpe_is = mean_is / vol_is if vol_is > 0 else 0
+
+    mean_oos = rolling_ret_oos.mean() * 252
+    vol_oos = rolling_ret_oos.std() * np.sqrt(252)
+    sharpe_oos = mean_oos / vol_oos if vol_oos > 0 else 0
+
+    print(f"\n{'Metric':<20} {'IS':>12} {'OOS':>12} {'Drift':>12}")
+    print("-" * 50)
+    print(f"{'Mean (ann %)':<20} {mean_is*100:>11.2f}% {mean_oos*100:>11.2f}% {(mean_oos-mean_is)*100:>11.2f}%")
+    print(f"{'Vol (ann %)':<20} {vol_is*100:>11.2f}% {vol_oos*100:>11.2f}% {(vol_oos-vol_is)*100:>11.2f}%")
+    print(f"{'Sharpe':<20} {sharpe_is:>11.2f} {sharpe_oos:>11.2f} {sharpe_oos-sharpe_is:>11.2f}")
+
+    return_stability = abs((sharpe_oos - sharpe_is) / (abs(sharpe_is) + 1e-8))
+    if return_stability < 0.25:
+        print("\n✓ STABLE: Return distributions similar IS vs OOS")
+        check1_pass = True
+    else:
+        print("\n⚠ UNSTABLE: Return distributions shift significantly")
+        check1_pass = False
+
+    # ====================================
+    # CHECK 2: PERFORMANCE CONSISTENCY
+    # ====================================
+    print("\n" + "="*70)
+    print("2. PERFORMANCE CONSISTENCY (IS vs OOS)")
+    print("="*70)
+
+    metrics_is = calc_metrics(rolling_ret_is)
+    metrics_oos = calc_metrics(rolling_ret_oos)
+
+    print(f"\n{'Metric':<20} {'IS':>12} {'OOS':>12} {'Ratio':>12}")
+    print("-" * 50)
+    print(f"{'Ann Return':<20} {metrics_is['ret']*100:>11.2f}% {metrics_oos['ret']*100:>11.2f}% {metrics_oos['ret']/metrics_is['ret'] if metrics_is['ret'] > 0 else 0:>11.2f}x")
+    print(f"{'Sharpe':<20} {metrics_is['sharpe']:>11.2f} {metrics_oos['sharpe']:>11.2f} {metrics_oos['sharpe']/metrics_is['sharpe'] if metrics_is['sharpe'] > 0 else 0:>11.2f}x")
+    print(f"{'Max DD':<20} {metrics_is['max_dd']*100:>11.2f}% {metrics_oos['max_dd']*100:>11.2f}% {metrics_oos['max_dd']/metrics_is['max_dd'] if metrics_is['max_dd'] != 0 else 0:>11.2f}x")
+
+    consistency = abs((metrics_oos['sharpe'] - metrics_is['sharpe']) / (abs(metrics_is['sharpe']) + 1e-8))
+    if consistency < 0.25:
+        print("\n✓ STABLE: Performance metrics persist OOS")
+        check2_pass = True
+    else:
+        print("\n⚠ UNSTABLE: Performance degrades significantly OOS")
+        check2_pass = False
+
+    # ====================================
+    # CHECK 3: DRAWDOWN BEHAVIOR
+    # ====================================
+    print("\n" + "="*70)
+    print("3. DRAWDOWN BEHAVIOR (IS vs OOS)")
+    print("="*70)
+
+    def get_drawdown_stats(ret_series):
+        cum = (1 + ret_series).cumprod()
+        running_max = cum.cummax()
+        dd = (cum - running_max) / running_max
+        max_dd = dd.min()
+        avg_dd = dd[dd < 0].mean() if (dd < 0).sum() > 0 else 0
+        return {'max_dd': max_dd, 'avg_dd': avg_dd}
+
+    dd_is = get_drawdown_stats(rolling_ret_is)
+    dd_oos = get_drawdown_stats(rolling_ret_oos)
+
+    print(f"\n{'Metric':<20} {'IS':>12} {'OOS':>12} {'Drift':>12}")
+    print("-" * 50)
+    print(f"{'Max Drawdown':<20} {dd_is['max_dd']*100:>11.2f}% {dd_oos['max_dd']*100:>11.2f}% {(dd_oos['max_dd']-dd_is['max_dd'])*100:>11.2f}%")
+    print(f"{'Avg Drawdown':<20} {dd_is['avg_dd']*100:>11.2f}% {dd_oos['avg_dd']*100:>11.2f}% {(dd_oos['avg_dd']-dd_is['avg_dd'])*100:>11.2f}%")
+
+    dd_stability = abs((dd_oos['max_dd'] - dd_is['max_dd']) / (abs(dd_is['max_dd']) + 1e-8))
+    if dd_stability < 0.35:
+        print("\n✓ STABLE: Drawdown behavior similar IS vs OOS")
+        check3_pass = True
+    else:
+        print("\n⚠ UNSTABLE: Drawdown behavior shifts significantly")
+        check3_pass = False
+
+    # ====================================
+    # CHECK 4: WIN RATE STABILITY
+    # ====================================
+    print("\n" + "="*70)
+    print("4. WIN RATE STABILITY (IS vs OOS)")
+    print("="*70)
+
+    win_rate_is = (rolling_ret_is > 0).sum() / len(rolling_ret_is)
+    win_rate_oos = (rolling_ret_oos > 0).sum() / len(rolling_ret_oos)
+
+    print(f"\n{'Metric':<20} {'IS':>12} {'OOS':>12} {'Drift':>12}")
+    print("-" * 50)
+    print(f"{'Win Rate':<20} {win_rate_is*100:>11.1f}% {win_rate_oos*100:>11.1f}% {(win_rate_oos-win_rate_is)*100:>11.1f}%")
+
+    wr_stability = abs(win_rate_oos - win_rate_is)
+    if wr_stability < 0.10:
+        print("\n✓ STABLE: Win rates consistent IS vs OOS")
+        check4_pass = True
+    else:
+        print("\n⚠ UNSTABLE: Win rates diverge significantly")
+        check4_pass = False
+
+    # ====================================
+    # OVERALL VERDICT
+    # ====================================
+    print("\n" + "="*70)
+    print("STABILITY SCORECARD (ROLLING GTO)")
+    print("="*70)
+
+    checks = {
+        'Return Distribution': check1_pass,
+        'Performance Consistency': check2_pass,
+        'Drawdown Behavior': check3_pass,
+        'Win Rate Stability': check4_pass
     }
 
-    for check, passed in stability_scores.items():
+    for check_name, passed in checks.items():
         status = "✓ PASS" if passed else "⚠ FAIL"
-        print(f"{check:<35} {status}")
+        print(f"{check_name:<35} {status}")
 
-    n_pass = sum(stability_scores.values())
-    n_total = len(stability_scores)
+    n_pass = sum(checks.values())
+    n_total = len(checks)
     print(f"\nOverall: {n_pass}/{n_total} stability checks passed")
 
     if n_pass >= 3:
-        print("\n→ VERDICT: Strategy shows reasonable stability.")
-        print("  Edge and P/L distributions persist out-of-sample.")
-        print("  GTO portfolio is TRADABLE with K-means regime detection.")
+        print("\n→ VERDICT: Rolling GTO shows GOOD stability.")
+        print("  Continuous reoptimization maintains edge OOS.")
+        print("  Strategy is STABLE and TRADABLE.")
         is_stable = True
     else:
-        print("\n→ VERDICT: Strategy lacks sufficient stability.")
-        print("  Edge degrades significantly out-of-sample.")
-        print("  Consider alternative approaches (TSMOM, hybrid strategies).")
+        print("\n→ VERDICT: Rolling GTO lacks sufficient stability.")
+        print("  Need to add constraints or smoothing.")
         is_stable = False
 
     # ====================================
-    # 6. SECONDARY PERFORMANCE METRICS
+    # TRANSACTION COST ANALYSIS
     # ====================================
     if is_stable:
         print("\n" + "="*70)
-        print("SECONDARY PERFORMANCE METRICS (supporting evidence only)")
+        print("TRANSACTION COST ANALYSIS")
         print("="*70)
+
+        opt_dates_sorted = sorted(rolling_weights.keys())
+        w_list = [rolling_weights[d] for d in opt_dates_sorted]
+        w_diffs = []
+        for i in range(1, len(w_list)):
+            diff = np.sum(np.abs(w_list[i] - w_list[i-1]))
+            w_diffs.append(diff)
+
+        avg_weight_drift = np.mean(w_diffs)
+
+        scenarios = [0, 5, 10, 20]
         
-        def compute_perf_metrics(ret_series):
-            ret = ret_series.dropna()
-            if len(ret) == 0:
-                return None
-            cum = (1 + ret).cumprod()
-            years = len(ret) / 252.0
-            ann_ret = cum.iloc[-1]**(1/years) - 1 if years > 0 else 0
-            vol = ret.std() * np.sqrt(252)
-            sharpe = ann_ret / vol if vol > 0 else 0
-            dd = (cum / cum.cummax() - 1).min()
-            return {'ret': ann_ret, 'vol': vol, 'sharpe': sharpe, 'dd': dd}
+        print(f"\n{'Cost Scenario':<30} {'Sharpe':>10} {'Ann Ret':>12} {'vs Static':>12}")
+        print("-" * 70)
+        print(f"{'No transaction costs':<30} {metrics_rolling['sharpe']:>10.2f} {metrics_rolling['ret']:>11.2%} {metrics_rolling['sharpe']/metrics_static['sharpe']:.2f}x")
+
+        best_sharpe_with_cost = 0
+        for cost_bps in scenarios:
+            rolling_portfolio_ret_costs = rolling_portfolio_ret.copy()
+            
+            for i in range(1, len(opt_dates_sorted)):
+                prev_date = opt_dates_sorted[i-1]
+                curr_date = opt_dates_sorted[i]
+                
+                w_prev = rolling_weights[prev_date]
+                w_curr = rolling_weights[curr_date]
+                drift = np.sum(np.abs(w_curr - w_prev))
+                cost = drift * (cost_bps / 10000)
+                
+                mask = (rolling_portfolio_ret_costs.index > prev_date) & (rolling_portfolio_ret_costs.index <= curr_date)
+                if mask.sum() > 0:
+                    first_day_idx = rolling_portfolio_ret_costs.index[mask][0]
+                    idx_in_series = rolling_portfolio_ret_costs.index.get_loc(first_day_idx)
+                    rolling_portfolio_ret_costs.iloc[idx_in_series] -= cost
+
+            metrics_with_cost = calc_metrics(rolling_portfolio_ret_costs)
+            ratio = metrics_with_cost['sharpe'] / metrics_static['sharpe'] if metrics_static['sharpe'] > 0 else 0
+            print(f"{cost_bps} bps per 1% drift{'':<14} {metrics_with_cost['sharpe']:>10.2f} {metrics_with_cost['ret']:>11.2%} {ratio:.2f}x")
+            
+            if cost_bps == 5:
+                best_sharpe_with_cost = metrics_with_cost['sharpe']
+
+        print(f"\n" + "="*70)
+        print("REALISTIC SCENARIO: 5 bps per 1% weight change")
+        print("="*70)
+        print(f"  Assumption: Bid-ask spread + slippage on rebalance")
+        print(f"  Average turnover per reopt: {avg_weight_drift:.1%}")
+        print(f"  Estimated cost per reopt: {avg_weight_drift * 5:.0f} bps")
+        print(f"  Rebalances per year: ~{252/reopt_freq:.0f}")
+        print(f"  Total annual cost: ~{avg_weight_drift * 5 * (252/reopt_freq):.0f} bps")
         
-        perf_is = compute_perf_metrics(gto_ret_is)
-        perf_oos = compute_perf_metrics(gto_ret_oos)
-        
-        print(f"\n{'Metric':<15} {'IS':>12} {'OOS':>12} {'Drift':>12}")
-        print("-" * 55)
-        print(f"{'Ann Return':<15} {perf_is['ret']*100:>11.2f}% {perf_oos['ret']*100:>11.2f}% {(perf_oos['ret']-perf_is['ret'])*100:>11.2f}%")
-        print(f"{'Volatility':<15} {perf_is['vol']*100:>11.2f}% {perf_oos['vol']*100:>11.2f}% {(perf_oos['vol']-perf_is['vol'])*100:>11.2f}%")
-        print(f"{'Sharpe':<15} {perf_is['sharpe']:>11.2f} {perf_oos['sharpe']:>11.2f} {perf_oos['sharpe']-perf_is['sharpe']:>11.2f}")
-        print(f"{'Max DD':<15} {perf_is['dd']*100:>11.2f}% {perf_oos['dd']*100:>11.2f}% {(perf_oos['dd']-perf_is['dd'])*100:>11.2f}%")
+        print(f"\nFinal Comparison (after realistic 5 bps costs):")
+        print(f"{'Strategy':<30} {'Sharpe':>12} {'Ann Ret':>12} {'vs Static':>12}")
+        print("-" * 70)
+        print(f"{'Static GTO':<30} {metrics_static['sharpe']:>12.2f} {metrics_static['ret']:>11.2%} {'baseline':>11}")
+        print(f"{'Rolling GTO (5 bps costs)':<30} {best_sharpe_with_cost:>12.2f} {metrics_rolling['ret']:>11.2%} {best_sharpe_with_cost/metrics_static['sharpe']:.2f}x")
 
 print("\n" + "="*70)
-print("ANALYSIS COMPLETE")
+print("ROLLING-WINDOW GTO ANALYSIS COMPLETE")
 print("="*70)
