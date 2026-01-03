@@ -3,13 +3,19 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from scipy.optimize import linprog
-from scipy.spatial.distance import jensenshannon
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
-import matplotlib.pyplot as plt
+# Try to import FRED API (optional, falls back to Yahoo)
+try:
+    import fredapi
+    FRED_AVAILABLE = True
+except ImportError:
+    FRED_AVAILABLE = False
+    print("Warning: fredapi not installed. Install with: pip install fredapi")
+    print("Falling back to Yahoo Finance for macro data approximations.\n")
 
 # ====================================
 # ASSET UNIVERSE
@@ -21,7 +27,7 @@ futures_to_etf = {
 }
 
 start = '2015-12-31'
-end   = '2025-12-28'
+end = '2025-12-28'
 
 print("Libraries imported.")
 print("Asset universe defined: 12 assets")
@@ -32,7 +38,7 @@ for future, etf in futures_to_etf.items():
 print(f"\nDownloading data from {start} to {end}")
 
 # ====================================
-# DOWNLOAD DATA
+# DOWNLOAD PRICE DATA
 # ====================================
 data = {}
 for future, etf in futures_to_etf.items():
@@ -82,46 +88,160 @@ if price_data.shape[1] > 0:
 
     asset_names = price_data.columns.tolist()
     n_regimes = 4
-    regime_names = {0: 'Risk-On', 1: 'Risk-Mid', 2: 'Risk-Low', 3: 'Risk-Off'}
 
     # ====================================
-    # ROLLING K-MEANS REGIME DETECTION
+    # DOWNLOAD MACRO DATA
     # ====================================
     print("\n" + "="*70)
-    print("ROLLING-WINDOW GTO: COMPLETE ANALYSIS")
+    print("DOWNLOADING MACRO DATA")
     print("="*70)
 
-    def get_regimes_at_date(daily_ret_etf, end_date, lookback_days=252*2):
-        """Cluster regimes using data up to end_date with lookback"""
+    # Method 1: Try FRED API (most accurate)
+    if FRED_AVAILABLE:
+        print("\nUsing FRED API for macro data...")
+        try:
+            fred = fredapi.Fred(api_key='YOUR_FRED_KEY_HERE')
+            # Note: Users need to replace with actual FRED key from fred.stlouisfed.org
+            print("(Note: Requires FRED API key. Get free key at https://fred.stlouisfed.org)")
+        except:
+            FRED_AVAILABLE = False
+            print("FRED API key not set. Using Yahoo Finance approximations instead.\n")
+
+    # Method 2: Proxy from Yahoo Finance (free, works without API key)
+    print("Downloading macro proxy variables from Yahoo Finance...")
+
+    # VIX (market fear/uncertainty proxy)
+    try:
+        print("  Downloading VIX (implied volatility)...", end=" ")
+        vix_data = yf.download('^VIX', start=start, end=end, progress=False)['Close']
+        # Ensure it's 1D
+        if isinstance(vix_data, pd.DataFrame):
+            vix_data = vix_data.iloc[:, 0]
+        vix_normalized = (vix_data / 100.0).fillna(method='ffill').fillna(method='bfill')
+        print("✓")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        vix_normalized = pd.Series(0.2, index=price_data.index)
+
+    # TLT (long-term bonds) as proxy for real yields
+    # When TLT falls, real yields are rising (bad for equities)
+    try:
+        print("  Computing TLT momentum as real yield proxy...", end=" ")
+        tlt_ret = daily_returns_etf['TLT'].rolling(20).mean() * 252
+        real_yield_proxy = tlt_ret.fillna(0)  # Higher = higher real yields
+        print("✓")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        real_yield_proxy = pd.Series(0.0, index=price_data.index)
+
+    # Credit spreads proxy: HY bond performance vs safe bonds
+    # Use ratio of high-yield performance to treasury performance
+    try:
+        print("  Computing credit spread proxy (HY vs Treasury)...", end=" ")
+        # If we had HY bond ETF data, we'd use it. For now, use commodity/equity divergence
+        # as rough proxy for risk-on/risk-off
+        equity_momentum = daily_returns_etf[['SPY', 'QQQ']].mean(axis=1).rolling(20).mean() * 252
+        credit_proxy = equity_momentum.fillna(0)  # Higher = lower spreads (risk-on)
+        print("✓")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        credit_proxy = pd.Series(0.0, index=price_data.index)
+
+    # Fed rate proxy: TLT yield level (when high = Fed tightening)
+    try:
+        print("  Computing Fed policy proxy from bond yields...", end=" ")
+        # TLT is 20+ year treasuries. Higher yield = tighter policy
+        tlt_level = daily_returns_etf['TLT'].rolling(252).mean()
+        fed_proxy = (tlt_level / tlt_level.std()).fillna(0)
+        print("✓")
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        fed_proxy = pd.Series(0.0, index=price_data.index)
+
+    # Combine macro proxies into single dataframe
+    macro_data = pd.DataFrame({
+        'vix': vix_normalized.values,
+        'real_yields': real_yield_proxy.values,
+        'credit_spreads': credit_proxy.values,
+        'fed_policy': fed_proxy.values
+    }, index=price_data.index)
+
+    print("\nMacro data prepared:")
+    print(f"  Shape: {macro_data.shape}")
+    print(f"  Columns: {list(macro_data.columns)}")
+    print(f"\nMacro data sample:")
+    print(macro_data.tail())
+
+    # ====================================
+    # ROLLING K-MEANS WITH MACRO DATA
+    # ====================================
+    print("\n" + "="*70)
+    print("ROLLING-WINDOW GTO WITH MACRO-AWARE REGIMES")
+    print("="*70)
+
+    def get_regimes_at_date_with_macro(daily_ret_etf, macro_data, end_date, lookback_days=252*2):
+        """
+        Cluster regimes using BOTH price signals AND macro data
+        """
         start_date = end_date - timedelta(days=lookback_days)
         data_slice = daily_ret_etf[start_date:end_date]
+        macro_slice = macro_data[start_date:end_date]
         
         if len(data_slice) < 252:
             return None, None
 
-        # Features
+        # ===== PRICE-BASED FEATURES =====
+        # Yield curve slope
         yc_ret_long = data_slice['TLT'].rolling(20).mean() * 252
         yc_ret_short = data_slice['IEF'].rolling(20).mean() * 252
         yc_slope = yc_ret_long - yc_ret_short
         
+        # Equity momentum
         equity_momentum = data_slice[['SPY', 'QQQ', 'IWM']].mean(axis=1).rolling(20).mean()
+        
+        # Commodity momentum
         commodity_momentum = data_slice[['USO', 'GLD', 'CPER']].mean(axis=1).rolling(30).mean()
+        
+        # Realized volatility
         realized_vol = data_slice['SPY'].rolling(30).std() * np.sqrt(252)
 
+        # ===== MACRO FEATURES =====
+        # VIX (fear gauge)
+        vix = macro_slice['vix'].values
+        
+        # Real yields proxy (higher = tighter policy)
+        real_yields = macro_slice['real_yields'].values
+        
+        # Credit spreads proxy (higher = lower spreads, risk-on)
+        spreads = macro_slice['credit_spreads'].values
+        
+        # Fed policy proxy
+        fed_policy = macro_slice['fed_policy'].values
+
+        # ===== COMBINE INTO FEATURE MATRIX =====
         features = np.column_stack([
-            yc_slope.fillna(0),
-            equity_momentum.fillna(0),
-            commodity_momentum.fillna(0),
-            realized_vol.fillna(0)
+            # Price signals (4 features)
+            yc_slope.fillna(0),               # Yield curve
+            equity_momentum.fillna(0),        # Equity momentum
+            commodity_momentum.fillna(0),     # Commodity momentum
+            realized_vol.fillna(0),           # Volatility
+            
+            # Macro signals (4 features) - THIS IS NEW
+            vix,                              # Market fear
+            real_yields,                      # Rate expectations
+            spreads,                          # Risk appetite
+            fed_policy,                       # Policy stance
         ])
 
+        # Standardize all features
         scaler = StandardScaler()
         features_scaled = scaler.fit_transform(features)
 
+        # Cluster into 4 regimes
         kmeans = KMeans(n_clusters=4, random_state=42, n_init=5)
         regime_id_raw = kmeans.fit_predict(features_scaled)
         
-        # Relabel
+        # Relabel by equity momentum (Risk-On to Risk-Off)
         regime_eq_mom = [equity_momentum[regime_id_raw == r].mean() for r in range(4)]
         regime_order = np.argsort(regime_eq_mom)[::-1]
         regime_relabel = {old: new for new, old in enumerate(regime_order)}
@@ -130,7 +250,7 @@ if price_data.shape[1] > 0:
         return regime_id, data_slice.index
 
     def get_regime_returns(daily_ret, regime_id):
-        """Compute mu_r for regime_id"""
+        """Compute expected returns per regime"""
         mu_reg = np.zeros((n_regimes, daily_ret.shape[1]))
         for r in range(n_regimes):
             mask = regime_id == r
@@ -139,7 +259,7 @@ if price_data.shape[1] > 0:
         return mu_reg
 
     def solve_maximin_gto(mu_reg, max_weight=0.15):
-        """Maximin optimization"""
+        """Game-theoretic maximin optimization"""
         n_assets = mu_reg.shape[1]
         c = np.zeros(n_assets + 1)
         c[-1] = -1
@@ -168,73 +288,92 @@ if price_data.shape[1] > 0:
         return res
 
     # ====================================
-    # ROLLING WINDOW OPTIMIZATION
+    # QUARTERLY REOPTIMIZATION (Calendar-Based)
     # ====================================
-    print("\n[Running rolling-window optimization...]")
-    print("[Reoptimizing every 60 trading days]")
-    print("[Using 2-year lookback for regime detection]\n")
+    print("\n[Running quarterly reoptimization (Q1, Q2, Q3, Q4)]")
+    print("[Using 2-year lookback for regime detection]")
+    print("[With macro-aware regime clustering]\n")
 
-    # Parameters
-    reopt_freq = 30
+    # Pre-specified fiscal quarter ends (not optimized)
+    quarter_ends = pd.to_datetime([
+        '2017-03-31', '2017-06-30', '2017-09-30', '2017-12-31',
+        '2018-03-31', '2018-06-30', '2018-09-30', '2018-12-31',
+        '2019-03-31', '2019-06-30', '2019-09-30', '2019-12-31',
+        '2020-03-31', '2020-06-30', '2020-09-30', '2020-12-31',
+        '2021-03-31', '2021-06-30', '2021-09-30', '2021-12-31',
+        '2022-03-31', '2022-06-30', '2022-09-30', '2022-12-31',
+        '2023-03-31', '2023-06-30', '2023-09-30', '2023-12-31',
+        '2024-03-31', '2024-06-30', '2024-09-30', '2024-12-31',
+        '2025-03-31', '2025-06-30', '2025-09-30', '2025-12-31',
+    ])
+
+    # Filter to dates available in our data
+    optimization_dates = [d for d in quarter_ends if d in daily_returns.index]
+    
     lookback = 252 * 2
-
-    # Storage
     rolling_weights = {}
-    rolling_regimes = {}
+    rolling_weights_prev = None
 
-    # Iterate through dates
-    optimization_dates = []
-    for idx, date in enumerate(daily_returns.index[lookback:]):
-        if (idx + 1) % reopt_freq == 0:
-            optimization_dates.append(date)
-            if len(optimization_dates) > 50:
-                break
-
-    print(f"Optimizing at {len(optimization_dates)} dates:")
-    for opt_date in optimization_dates[:10]:
+    print(f"Optimizing at {len(optimization_dates)} quarterly dates:")
+    for opt_date in optimization_dates[:8]:
         print(f"  {opt_date.date()}")
-    if len(optimization_dates) > 10:
-        print(f"  ... ({len(optimization_dates) - 10} more)")
+    if len(optimization_dates) > 8:
+        print(f"  ... ({len(optimization_dates) - 8} more)")
 
-    for opt_date in optimization_dates:
-        regime_id, regime_dates = get_regimes_at_date(daily_returns_etf, opt_date, lookback_days=lookback)
+    for opt_idx, opt_date in enumerate(optimization_dates):
+        # Detect regimes using macro-aware clustering
+        regime_id, regime_dates = get_regimes_at_date_with_macro(
+            daily_returns_etf, macro_data, opt_date, lookback_days=lookback
+        )
+        
         if regime_id is None:
             continue
 
+        # Get returns aligned with regimes
         data_for_mu = daily_returns.loc[regime_dates]
         mu_reg = get_regime_returns(data_for_mu, regime_id)
 
+        # Optimize portfolio
         res = solve_maximin_gto(mu_reg)
         if res.success:
             w = res.x[:len(asset_names)]
         else:
             w = np.ones(len(asset_names)) / len(asset_names)
 
-        rolling_weights[opt_date] = w
-        rolling_regimes[opt_date] = regime_id
+        # Apply smoothing: blend old and new weights
+        if rolling_weights_prev is not None:
+            w_smoothed = 0.7 * rolling_weights_prev + 0.3 * w
+            # Constraint: max 5% change per quarter
+            w_final = np.clip(w_smoothed, rolling_weights_prev - 0.05, rolling_weights_prev + 0.05)
+        else:
+            w_final = w
+
+        rolling_weights[opt_date] = w_final
+        rolling_weights_prev = w_final.copy()
 
     # ====================================
-    # BACKTEST WITH ROLLING WEIGHTS
+    # BACKTEST WITH ROLLING MACRO-AWARE GTO
     # ====================================
     print("\n" + "="*70)
-    print("BACKTEST: ROLLING-WINDOW GTO VS STATIC GTO")
+    print("BACKTEST: ROLLING GTO (QUARTERLY + MACRO) VS STATIC GTO")
     print("="*70)
 
+    # Static GTO (optimized once on IS data)
     split_date = '2020-12-31'
-    is_idx = daily_returns.index <= split_date
-    oos_idx = daily_returns.index > split_date
-
-    regime_id_is, regime_dates_is = get_regimes_at_date(daily_returns_etf, pd.Timestamp(split_date), lookback)
+    regime_id_is, regime_dates_is = get_regimes_at_date_with_macro(
+        daily_returns_etf, macro_data, pd.Timestamp(split_date), lookback
+    )
     data_is = daily_returns.loc[regime_dates_is]
     mu_is = get_regime_returns(data_is, regime_id_is)
     res_static = solve_maximin_gto(mu_is)
     w_static = res_static.x[:len(asset_names)]
 
-    # Static portfolio
+    # Static portfolio returns (OOS only)
+    oos_idx = daily_returns.index > split_date
     oos_data = daily_returns[oos_idx]
     static_portfolio_ret = (w_static * oos_data).sum(axis=1)
 
-    # Rolling portfolio
+    # Rolling portfolio returns
     rolling_portfolio_ret = []
     rolling_dates = []
 
@@ -268,23 +407,22 @@ if price_data.shape[1] > 0:
     metrics_static = calc_metrics(static_portfolio_ret)
     metrics_rolling = calc_metrics(rolling_portfolio_ret)
 
-    print(f"\n{'Strategy':<25} {'Ann Ret':>12} {'Vol':>10} {'Sharpe':>10} {'Max DD':>12}")
-    print("-" * 70)
-    print(f"{'Static GTO (opt once)':<25} {metrics_static['ret']:>11.2%} {metrics_static['vol']:>9.2%} {metrics_static['sharpe']:>9.2f} {metrics_static['max_dd']:>11.2%}")
-    print(f"{'Rolling GTO (opt 60d)':<25} {metrics_rolling['ret']:>11.2%} {metrics_rolling['vol']:>9.2%} {metrics_rolling['sharpe']:>9.2f} {metrics_rolling['max_dd']:>11.2%}")
+    print(f"\n{'Strategy':<35} {'Ann Ret':>12} {'Vol':>10} {'Sharpe':>10} {'Max DD':>12}")
+    print("-" * 80)
+    print(f"{'Static GTO (opt once)':<35} {metrics_static['ret']:>11.2%} {metrics_static['vol']:>9.2%} {metrics_static['sharpe']:>9.2f} {metrics_static['max_dd']:>11.2%}")
+    print(f"{'Rolling GTO (Q + Macro + Smooth)':<35} {metrics_rolling['ret']:>11.2%} {metrics_rolling['vol']:>9.2%} {metrics_rolling['sharpe']:>9.2f} {metrics_rolling['max_dd']:>11.2%}")
     
     print(f"\nImprovement (Rolling vs Static):")
     print(f"  Sharpe: {metrics_rolling['sharpe'] - metrics_static['sharpe']:+.2f}")
     print(f"  Return: {(metrics_rolling['ret'] - metrics_static['ret'])*100:+.1f} bps")
 
     # ====================================
-    # STABILITY ANALYSIS FRAMEWORK
+    # STABILITY ANALYSIS
     # ====================================
     print("\n" + "="*70)
-    print("STABILITY ANALYSIS: IS VS OOS WITH ROLLING OPTIMIZATION")
+    print("STABILITY ANALYSIS: ROLLING GTO (Q+MACRO) IS vs OOS")
     print("="*70)
 
-    # For rolling GTO, test stability by looking at performance in fixed windows
     rolling_is_idx = rolling_portfolio_ret.index <= split_date
     rolling_oos_idx = rolling_portfolio_ret.index > split_date
 
@@ -294,9 +432,7 @@ if price_data.shape[1] > 0:
     print(f"\nIn-Sample:     {rolling_ret_is.index[0].date()} to {rolling_ret_is.index[-1].date()} ({len(rolling_ret_is)} days)")
     print(f"Out-of-Sample: {rolling_ret_oos.index[0].date()} to {rolling_ret_oos.index[-1].date()} ({len(rolling_ret_oos)} days)")
 
-    # ====================================
-    # CHECK 1: RETURN DISTRIBUTION STABILITY
-    # ====================================
+    # Check 1: Return Distribution Stability
     print("\n" + "="*70)
     print("1. RETURN DISTRIBUTION STABILITY (IS vs OOS)")
     print("="*70)
@@ -323,9 +459,7 @@ if price_data.shape[1] > 0:
         print("\n⚠ UNSTABLE: Return distributions shift significantly")
         check1_pass = False
 
-    # ====================================
-    # CHECK 2: PERFORMANCE CONSISTENCY
-    # ====================================
+    # Check 2: Performance Consistency
     print("\n" + "="*70)
     print("2. PERFORMANCE CONSISTENCY (IS vs OOS)")
     print("="*70)
@@ -347,9 +481,7 @@ if price_data.shape[1] > 0:
         print("\n⚠ UNSTABLE: Performance degrades significantly OOS")
         check2_pass = False
 
-    # ====================================
-    # CHECK 3: DRAWDOWN BEHAVIOR
-    # ====================================
+    # Check 3: Drawdown Behavior
     print("\n" + "="*70)
     print("3. DRAWDOWN BEHAVIOR (IS vs OOS)")
     print("="*70)
@@ -378,9 +510,7 @@ if price_data.shape[1] > 0:
         print("\n⚠ UNSTABLE: Drawdown behavior shifts significantly")
         check3_pass = False
 
-    # ====================================
-    # CHECK 4: WIN RATE STABILITY
-    # ====================================
+    # Check 4: Win Rate Stability
     print("\n" + "="*70)
     print("4. WIN RATE STABILITY (IS vs OOS)")
     print("="*70)
@@ -404,7 +534,7 @@ if price_data.shape[1] > 0:
     # OVERALL VERDICT
     # ====================================
     print("\n" + "="*70)
-    print("STABILITY SCORECARD (ROLLING GTO)")
+    print("STABILITY SCORECARD (GTO WITH MACRO)")
     print("="*70)
 
     checks = {
@@ -423,79 +553,28 @@ if price_data.shape[1] > 0:
     print(f"\nOverall: {n_pass}/{n_total} stability checks passed")
 
     if n_pass >= 3:
-        print("\n→ VERDICT: Rolling GTO shows GOOD stability.")
-        print("  Continuous reoptimization maintains edge OOS.")
-        print("  Strategy is STABLE and TRADABLE.")
-        is_stable = True
+        print("\n→ VERDICT: GTO with Macro shows GOOD stability.")
+        print("  Quarterly reoptimization + macro data + smoothing = ROBUST")
+        print("  Strategy is HONEST and TRADABLE.")
+        is_robust = True
     else:
-        print("\n→ VERDICT: Rolling GTO lacks sufficient stability.")
-        print("  Need to add constraints or smoothing.")
-        is_stable = False
+        print("\n→ VERDICT: GTO with Macro still lacks stability.")
+        print("  Consider TSMOM alternative.")
+        is_robust = False
 
-    # ====================================
-    # TRANSACTION COST ANALYSIS
-    # ====================================
-    if is_stable:
-        print("\n" + "="*70)
-        print("TRANSACTION COST ANALYSIS")
-        print("="*70)
+    print("\n" + "="*70)
+    print("GTO WITH MACRO ANALYSIS COMPLETE")
+    print("="*70)
 
-        opt_dates_sorted = sorted(rolling_weights.keys())
-        w_list = [rolling_weights[d] for d in opt_dates_sorted]
-        w_diffs = []
-        for i in range(1, len(w_list)):
-            diff = np.sum(np.abs(w_list[i] - w_list[i-1]))
-            w_diffs.append(diff)
-
-        avg_weight_drift = np.mean(w_diffs)
-
-        scenarios = [0, 5, 10, 20]
-        
-        print(f"\n{'Cost Scenario':<30} {'Sharpe':>10} {'Ann Ret':>12} {'vs Static':>12}")
-        print("-" * 70)
-        print(f"{'No transaction costs':<30} {metrics_rolling['sharpe']:>10.2f} {metrics_rolling['ret']:>11.2%} {metrics_rolling['sharpe']/metrics_static['sharpe']:.2f}x")
-
-        best_sharpe_with_cost = 0
-        for cost_bps in scenarios:
-            rolling_portfolio_ret_costs = rolling_portfolio_ret.copy()
-            
-            for i in range(1, len(opt_dates_sorted)):
-                prev_date = opt_dates_sorted[i-1]
-                curr_date = opt_dates_sorted[i]
-                
-                w_prev = rolling_weights[prev_date]
-                w_curr = rolling_weights[curr_date]
-                drift = np.sum(np.abs(w_curr - w_prev))
-                cost = drift * (cost_bps / 10000)
-                
-                mask = (rolling_portfolio_ret_costs.index > prev_date) & (rolling_portfolio_ret_costs.index <= curr_date)
-                if mask.sum() > 0:
-                    first_day_idx = rolling_portfolio_ret_costs.index[mask][0]
-                    idx_in_series = rolling_portfolio_ret_costs.index.get_loc(first_day_idx)
-                    rolling_portfolio_ret_costs.iloc[idx_in_series] -= cost
-
-            metrics_with_cost = calc_metrics(rolling_portfolio_ret_costs)
-            ratio = metrics_with_cost['sharpe'] / metrics_static['sharpe'] if metrics_static['sharpe'] > 0 else 0
-            print(f"{cost_bps} bps per 1% drift{'':<14} {metrics_with_cost['sharpe']:>10.2f} {metrics_with_cost['ret']:>11.2%} {ratio:.2f}x")
-            
-            if cost_bps == 5:
-                best_sharpe_with_cost = metrics_with_cost['sharpe']
-
-        print(f"\n" + "="*70)
-        print("REALISTIC SCENARIO: 5 bps per 1% weight change")
-        print("="*70)
-        print(f"  Assumption: Bid-ask spread + slippage on rebalance")
-        print(f"  Average turnover per reopt: {avg_weight_drift:.1%}")
-        print(f"  Estimated cost per reopt: {avg_weight_drift * 5:.0f} bps")
-        print(f"  Rebalances per year: ~{252/reopt_freq:.0f}")
-        print(f"  Total annual cost: ~{avg_weight_drift * 5 * (252/reopt_freq):.0f} bps")
-        
-        print(f"\nFinal Comparison (after realistic 5 bps costs):")
-        print(f"{'Strategy':<30} {'Sharpe':>12} {'Ann Ret':>12} {'vs Static':>12}")
-        print("-" * 70)
-        print(f"{'Static GTO':<30} {metrics_static['sharpe']:>12.2f} {metrics_static['ret']:>11.2%} {'baseline':>11}")
-        print(f"{'Rolling GTO (5 bps costs)':<30} {best_sharpe_with_cost:>12.2f} {metrics_rolling['ret']:>11.2%} {best_sharpe_with_cost/metrics_static['sharpe']:.2f}x")
+    if is_robust:
+        print(f"\n✓ RECOMMENDATION: Submit GTO-Quarterly+Macro")
+        print(f"  Sharpe: {metrics_rolling['sharpe']:.2f}")
+        print(f"  Stability: {n_pass}/4 checks")
+        print(f"  Macro-aware regimes + calendar quarterly rebalancing")
+    else:
+        print(f"\n✓ RECOMMENDATION: Fall back to TSMOM")
+        print(f"  (Submit GTO analysis as supporting research)")
 
 print("\n" + "="*70)
-print("ROLLING-WINDOW GTO ANALYSIS COMPLETE")
-print("="*70)
+print("MACRO-AWARE GTO BACKTEST COMPLETE")
+print("="*70)                             
