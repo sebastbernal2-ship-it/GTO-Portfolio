@@ -175,7 +175,7 @@ if price_data.shape[1] > 0:
     print("[Using 2-year lookback for regime detection]\n")
 
     # Parameters
-    reopt_freq = 60
+    reopt_freq = 30
     lookback = 252 * 2
 
     # Storage
